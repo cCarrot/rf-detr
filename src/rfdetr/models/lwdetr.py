@@ -32,6 +32,7 @@ if TYPE_CHECKING:
 from rfdetr.models._defaults import MODEL_DEFAULTS, ModelDefaults
 from rfdetr.models._types import BuilderArgs
 from rfdetr.models.backbone import Joiner, build_backbone
+from rfdetr.models.local_contrast_enhancer import DifferentiableLocalContrastEnhancer
 
 # Backward-compat re-exports: loss functions that used to live in this module
 from rfdetr.models.criterion import (  # noqa: F401 — backward compat
@@ -152,6 +153,8 @@ class LWDETR(nn.Module):
         hidden_dim = transformer.d_model
         self.class_embed = nn.Linear(hidden_dim, num_classes)
         self.bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
+        # Trainable enhancement is part of the standard detector forward path.
+        self.local_contrast_enhancer = DifferentiableLocalContrastEnhancer()
         self.segmentation_head = segmentation_head
         query_dim = 4
         self.refpoint_embed = nn.Embedding(num_queries * group_detr, query_dim)
@@ -228,6 +231,12 @@ class LWDETR(nn.Module):
                 )
 
         self._export = False
+
+    def enhance_samples(self, samples: NestedTensor | Tensor | list[Tensor]) -> NestedTensor:
+        """Apply the trainable enhancer while preserving the NestedTensor mask."""
+        if isinstance(samples, (list, Tensor)):
+            samples = nested_tensor_from_tensor_list(samples)
+        return NestedTensor(self.local_contrast_enhancer(samples.tensors, samples.mask), samples.mask)
 
     def reinitialize_detection_head(self, num_classes: int) -> None:
         """Resize the detection classification head to *num_classes* outputs.
@@ -496,6 +505,7 @@ class LWDETR(nn.Module):
         """
         if isinstance(samples, (list, Tensor)):
             samples = nested_tensor_from_tensor_list(samples)
+        samples = self.enhance_samples(samples)
         features, poss, cross_attn_features = self.backbone(samples)
 
         srcs = []
@@ -671,6 +681,7 @@ class LWDETR(nn.Module):
             ``(boxes, logits)`` for detection, ``(boxes, logits, masks)`` for segmentation, or
             ``(boxes, logits, keypoints)`` for keypoint models.
         """
+        tensors = self.local_contrast_enhancer(tensors)
         srcs, _, poss, cross_attn_srcs = self.backbone(tensors)
         # only use one group in inference
         refpoint_embed_weight = self.refpoint_embed.weight[: self.num_queries]
